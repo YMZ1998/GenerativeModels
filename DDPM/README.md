@@ -140,7 +140,7 @@ python -m pip install visdom
 python -m visdom.server -p 8097
 ```
 
-Then open `http://localhost:8097` in a browser and run training normally. With the default config, the environment is `ddpm_pelvis`; the sample panel shows validation groups, one group per row: CBCT, real CT, and a denoised CT prediction from a fixed validation timestep. `visdom_num_images` controls how many groups are shown, while `visdom_inference_batch_size` controls how many preview samples are passed through the network at once. Keep `visdom_inference_batch_size=1` for 512x512 training to avoid CUDA out-of-memory during visualization. This is more useful during early training than full random-noise sampling, which will look like static until the model is well trained.
+Then open `http://localhost:8097` in a browser and run training normally. With the default config, the environment is `ddpm_pelvis`; the sample panel shows validation groups, one group per row: CBCT, real CT, and denoised CT predictions at `visdom_preview_timesteps` such as `50`, `200`, and `500`. `visdom_num_images` controls how many groups are shown, while `visdom_inference_batch_size` controls how many preview samples are passed through the network at once. Keep `visdom_inference_batch_size=1` for 512x512 training to avoid CUDA out-of-memory during visualization. Low preview timesteps should preserve structure first; high timesteps are a harder generation diagnostic.
 
 ## Inference
 
@@ -186,11 +186,19 @@ python DDPM/infer_mhd.py `
   --scheduler ddim `
   --num-inference-steps 25 `
   --mode img2img `
-  --strength 0.35 `
+  --strength 0.1 `
   --batch-size 1
 ```
 
-The MHD script writes an `.mhd/.raw` pair and restores the prediction to the original input grid by default. Add `--keep-working-grid` only if you want to save the config-spacing working grid. MHD inference defaults to DDIM with `mhd_num_inference_steps=25` and `--mode img2img`, which starts from a noised CBCT slice so the output keeps input anatomy. Use `--mode sample` for pure DDPM sampling from noise, but that usually needs a well-trained in-domain model. Keep `--batch-size 1` for 512x512 inference if GPU memory is tight.
+The MHD script writes an `.mhd/.raw` pair and preserves the input MHD size, spacing, origin, direction, and pixel type by default. Internally it resizes each slice to `spatial_size` for the model, then resizes the prediction back to the input size before saving. Add `--keep-working-grid` only if you intentionally want to save the internal `512x512xz` working grid. Add `--use-spacing-resample` only if you intentionally want the older config-spacing behavior. Add `--output-pixel-type float32` only if you want a floating-point output. MHD inference defaults to DDIM with `mhd_num_inference_steps=25` and `--mode img2img`, which starts from a lightly noised CBCT slice so the output keeps input anatomy. Use `--mode sample` for pure DDPM sampling from noise, but that usually needs a well-trained in-domain model. Keep `--batch-size 1` for 512x512 inference if GPU memory is tight.
+
+To debug MHD resizing without running the model:
+
+```powershell
+python DDPM/infer_mhd.py `
+  --output D:/Data/cbct/denoise_output_resize_debug.mhd `
+  --debug-resize-only
+```
 
 ## Quick Smoke Test
 

@@ -8,6 +8,7 @@ from typing import Sequence
 import numpy as np
 import SimpleITK as sitk
 import torch
+import torch.nn.functional as F
 from torch.amp import autocast
 from tqdm import tqdm
 
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         default="best",
         help="Checkpoint path, or alias 'best'/'latest' under config output_dir.",
     )
-    parser.add_argument("--device", type=str, default=None, help="Override device, for example cuda:1 or cpu.")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Override device, for example cuda:1 or cpu.")
     parser.add_argument("--batch-size", type=int, default=1, help="Number of axial slices sampled at once.")
     parser.add_argument(
         "--scheduler",
@@ -67,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strength",
         type=float,
-        default=0.35,
+        default=0.1,
         help="Noise strength for img2img mode. Lower is closer to CBCT; higher changes more but can become noisy.",
     )
     parser.add_argument(
@@ -82,25 +83,56 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Call torch.cuda.empty_cache every N slice batches. 0 disables it for better speed.",
     )
-    parser.add_argument("--no-resample", action="store_true", help="Do not resample input to config spacing.")
+    parser.add_argument(
+        "--use-spacing-resample",
+        action="store_true",
+        help="Use config spacing to resample the whole volume. Disabled by default for MHD inference.",
+    )
+    parser.add_argument(
+        "--no-resize",
+        action="store_true",
+        help="Do not resize the input volume to config spatial_size before inference.",
+    )
+    parser.add_argument(
+        "--resize-spacing",
+        choices=("same", "keep-fov"),
+        default="same",
+        help="MHD spacing after in-plane resize. 'same' preserves input spacing; 'keep-fov' changes spacing to preserve physical FOV.",
+    )
+    parser.add_argument(
+        "--debug-resize-only",
+        action="store_true",
+        help="Only write the resized input MHD, then exit without running the model.",
+    )
+    parser.add_argument(
+        "--no-resample",
+        action="store_true",
+        help="Deprecated alias kept for compatibility; spacing resampling is already disabled by default.",
+    )
     parser.add_argument(
         "--restore-original-grid",
         dest="restore_original_grid",
         action="store_true",
         default=True,
-        help="Resample the prediction back to the input MHD size/spacing/origin/direction before saving.",
+        help="Save the prediction with the input MHD size/spacing/origin/direction. Enabled by default.",
     )
     parser.add_argument(
         "--keep-working-grid",
         dest="restore_original_grid",
         action="store_false",
-        help="Save the prediction on the config-spacing working grid instead of the original input grid.",
+        help="Save the prediction on the internal model working grid instead of the original input grid.",
     )
     parser.add_argument(
         "--outside-fill",
         choices=("cbct", "hu-min", "zero"),
         default="cbct",
         help="Fill value outside the center model patch when the input slice is larger than spatial_size.",
+    )
+    parser.add_argument(
+        "--output-pixel-type",
+        choices=("same", "float32", "float64", "int16", "uint16", "int32", "uint32", "uint8", "int8"),
+        default="same",
+        help="Output MHD pixel type. 'same' preserves the input MHD pixel type.",
     )
     parser.add_argument("--no-amp", action="store_true", help="Disable CUDA autocast during inference.")
     return parser.parse_args()
@@ -121,7 +153,7 @@ def resolve_checkpoint_path(checkpoint: str, output_dir: str | Path) -> Path:
     return path
 
 
-def resample_image(image: sitk.Image, spacing: Sequence[float]) -> sitk.Image:
+def resample_image_to_spacing(image: sitk.Image, spacing: Sequence[float]) -> sitk.Image:
     old_spacing = np.array(image.GetSpacing(), dtype=np.float64)
     new_spacing = np.array([float(v) for v in spacing], dtype=np.float64)
     old_size = np.array(image.GetSize(), dtype=np.int64)
@@ -137,12 +169,74 @@ def resample_image(image: sitk.Image, spacing: Sequence[float]) -> sitk.Image:
     return resampler.Execute(image)
 
 
+def resize_image_inplane(image: sitk.Image, spatial_size_hw: Sequence[int], spacing_mode: str = "same") -> sitk.Image:
+    old_size = image.GetSize()
+    old_spacing = image.GetSpacing()
+    target_h, target_w = int(spatial_size_hw[0]), int(spatial_size_hw[1])
+    image_array = sitk.GetArrayFromImage(image).astype(np.float32)
+    image_tensor = torch.from_numpy(image_array).unsqueeze(1)
+    resized_array = (
+        F.interpolate(image_tensor, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        .squeeze(1)
+        .numpy()
+        .astype(np.float32)
+    )
+
+    resized_image = sitk.GetImageFromArray(resized_array)
+    if spacing_mode == "keep-fov":
+        new_spacing = (
+            float(old_spacing[0]) * float(old_size[0]) / float(target_w),
+            float(old_spacing[1]) * float(old_size[1]) / float(target_h),
+            float(old_spacing[2]),
+        )
+    else:
+        new_spacing = old_spacing
+    resized_image.SetSpacing(tuple(float(v) for v in new_spacing))
+    resized_image.SetOrigin(image.GetOrigin())
+    resized_image.SetDirection(image.GetDirection())
+    return resized_image
+
+
+def resize_volume_array_inplane(volume_zyx: np.ndarray, target_hw: Sequence[int]) -> np.ndarray:
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    volume_tensor = torch.from_numpy(volume_zyx.astype(np.float32, copy=False)).unsqueeze(1)
+    return (
+        F.interpolate(volume_tensor, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        .squeeze(1)
+        .numpy()
+        .astype(np.float32)
+    )
+
+
 def resample_to_reference(image: sitk.Image, reference: sitk.Image, default_value: float) -> sitk.Image:
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(reference)
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(float(default_value))
     return resampler.Execute(image)
+
+
+def resolve_output_pixel_id(output_pixel_type: str, reference: sitk.Image) -> int:
+    if output_pixel_type == "same":
+        return int(reference.GetPixelID())
+
+    pixel_ids = {
+        "float32": sitk.sitkFloat32,
+        "float64": sitk.sitkFloat64,
+        "int16": sitk.sitkInt16,
+        "uint16": sitk.sitkUInt16,
+        "int32": sitk.sitkInt32,
+        "uint32": sitk.sitkUInt32,
+        "uint8": sitk.sitkUInt8,
+        "int8": sitk.sitkInt8,
+    }
+    return int(pixel_ids[output_pixel_type])
+
+
+def cast_image_pixel_type(image: sitk.Image, pixel_id: int) -> sitk.Image:
+    if int(image.GetPixelID()) == int(pixel_id):
+        return image
+    return sitk.Cast(image, pixel_id)
 
 
 def paste_center_patch(
@@ -278,22 +372,49 @@ def main() -> None:
     print(f"mode: {args.mode}")
     print(f"strength: {args.strength}")
     print(f"num_inference_steps: {num_inference_steps}")
-    print(f"resample_to_config_spacing: {not args.no_resample and config.get('spacing') is not None}")
+    print(f"use_spacing_resample: {args.use_spacing_resample}")
+    print(f"resize_to_spatial_size: {not args.no_resize}")
+    print(f"resize_spacing: {args.resize_spacing}")
+    print(f"debug_resize_only: {args.debug_resize_only}")
     print(f"restore_original_grid: {args.restore_original_grid}")
     print(f"outside_fill: {args.outside_fill}")
+    print(f"output_pixel_type: {args.output_pixel_type}")
     print(f"empty_cache_interval: {args.empty_cache_interval}")
     print("")
 
     input_image = sitk.ReadImage(str(input_path))
+    output_pixel_id = resolve_output_pixel_id(args.output_pixel_type, input_image)
     working_image = input_image
-    if not args.no_resample and config.get("spacing") is not None:
-        working_image = resample_image(input_image, config["spacing"])
+    if args.use_spacing_resample and config.get("spacing") is not None:
+        working_image = resample_image_to_spacing(input_image, config["spacing"])
+    elif not args.no_resize:
+        working_image = resize_image_inplane(input_image, config["spatial_size"], spacing_mode=args.resize_spacing)
+
+    if args.debug_resize_only:
+        if args.restore_original_grid:
+            debug_array = sitk.GetArrayFromImage(working_image).astype(np.float32)
+            input_h, input_w = int(input_image.GetSize()[1]), int(input_image.GetSize()[0])
+            debug_array = resize_volume_array_inplane(debug_array, (input_h, input_w))
+            debug_image = sitk.GetImageFromArray(debug_array)
+            debug_image.CopyInformation(input_image)
+        else:
+            debug_image = working_image
+        debug_image = cast_image_pixel_type(debug_image, output_pixel_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(debug_image, str(output_path))
+        print(f"Input MHD size xyz: {input_image.GetSize()} | spacing xyz: {input_image.GetSpacing()}")
+        print(f"Input pixel type: {input_image.GetPixelIDTypeAsString()}")
+        print(f"Debug output MHD size xyz: {debug_image.GetSize()} | spacing xyz: {debug_image.GetSpacing()}")
+        print(f"Debug output pixel type: {debug_image.GetPixelIDTypeAsString()}")
+        print(f"Saved resized input MHD: {output_path}")
+        return
 
     cbct_array = sitk.GetArrayFromImage(working_image).astype(np.float32)
     depth, height, width = cbct_array.shape
     finite_values = cbct_array[np.isfinite(cbct_array)]
     percentiles = np.percentile(finite_values, [0, 1, 50, 99, 100]) if finite_values.size else [np.nan] * 5
     print(f"Input MHD size xyz: {input_image.GetSize()} | spacing xyz: {input_image.GetSpacing()}")
+    print(f"Input pixel type: {input_image.GetPixelIDTypeAsString()}")
     print(f"Working volume shape zyx: {cbct_array.shape} | spacing xyz: {working_image.GetSpacing()}")
     print(
         "Working intensity percentiles: "
@@ -350,11 +471,18 @@ def main() -> None:
         if device.type == "cuda" and int(args.empty_cache_interval) > 0 and batch_index % int(args.empty_cache_interval) == 0:
             torch.cuda.empty_cache()
 
-    output_image = sitk.GetImageFromArray(output_array)
-    output_image.CopyInformation(working_image)
-
     if args.restore_original_grid:
-        output_image = resample_to_reference(output_image, input_image, default_value=float(config["hu_min"]))
+        input_h, input_w = int(input_image.GetSize()[1]), int(input_image.GetSize()[0])
+        output_array = resize_volume_array_inplane(output_array, (input_h, input_w))
+        output_image = sitk.GetImageFromArray(output_array)
+        output_image.CopyInformation(input_image)
+    else:
+        output_image = sitk.GetImageFromArray(output_array)
+        output_image.CopyInformation(working_image)
+
+    output_image = cast_image_pixel_type(output_image, output_pixel_id)
+    print(f"Output MHD size xyz: {output_image.GetSize()} | spacing xyz: {output_image.GetSpacing()}")
+    print(f"Output pixel type: {output_image.GetPixelIDTypeAsString()}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(output_image, str(output_path))

@@ -99,6 +99,21 @@ class VisdomReporter:
         images = self._orient_for_display(images, config)
         return ((images.detach().float().cpu().clamp(-1, 1) + 1.0) * 0.5).clamp(0, 1)
 
+    def _preview_timesteps(self, config: dict) -> list[int]:
+        raw_timesteps = config.get("visdom_preview_timesteps")
+        if raw_timesteps is None:
+            raw_timesteps = [config.get("visdom_preview_timestep", int(config["num_train_timesteps"]) // 2)]
+        if not isinstance(raw_timesteps, (list, tuple)):
+            raw_timesteps = [raw_timesteps]
+
+        max_timestep = int(config["num_train_timesteps"]) - 1
+        preview_timesteps = []
+        for value in raw_timesteps:
+            timestep = max(0, min(int(value), max_timestep))
+            if timestep not in preview_timesteps:
+                preview_timesteps.append(timestep)
+        return preview_timesteps or [max(0, min(int(config["num_train_timesteps"]) // 2, max_timestep))]
+
     @torch.no_grad()
     def show_input_preview(self, val_loader: DataLoader, config: dict) -> None:
         if not self.enabled or self.viz is None:
@@ -142,8 +157,7 @@ class VisdomReporter:
             cbct_cpu = batch["cbct"][:num_images]
             target_ct_cpu = batch["ct"][: cbct_cpu.shape[0]]
             inference_batch_size = min(inference_batch_size, cbct_cpu.shape[0])
-            preview_timestep = int(config.get("visdom_preview_timestep", int(config["num_train_timesteps"]) // 2))
-            preview_timestep = max(0, min(preview_timestep, int(config["num_train_timesteps"]) - 1))
+            preview_timesteps = self._preview_timesteps(config)
 
             model.eval()
             panel_chunks = []
@@ -151,20 +165,26 @@ class VisdomReporter:
                 end = min(start + inference_batch_size, cbct_cpu.shape[0])
                 cbct = cbct_cpu[start:end].to(self.device, non_blocking=True)
                 target_ct = target_ct_cpu[start:end].to(self.device, non_blocking=True)
-                timesteps = torch.full((target_ct.shape[0],), preview_timestep, device=self.device, dtype=torch.long)
-                noise = torch.randn_like(target_ct)
-                noisy_ct = scheduler.add_noise(original_samples=target_ct, noise=noise, timesteps=timesteps)
-                model_input = torch.cat((cbct, noisy_ct), dim=1)
+                row_items = [cbct, target_ct]
+                for preview_timestep in preview_timesteps:
+                    timesteps = torch.full(
+                        (target_ct.shape[0],), preview_timestep, device=self.device, dtype=torch.long
+                    )
+                    noise = torch.randn_like(target_ct)
+                    noisy_ct = scheduler.add_noise(original_samples=target_ct, noise=noise, timesteps=timesteps)
+                    model_input = torch.cat((cbct, noisy_ct), dim=1)
 
-                with autocast(device_type=self.device.type, enabled=use_amp):
-                    predicted_noise = model(x=model_input, timesteps=timesteps)
+                    with autocast(device_type=self.device.type, enabled=use_amp):
+                        predicted_noise = model(x=model_input, timesteps=timesteps)
 
-                alphas_cumprod = scheduler.alphas_cumprod.to(device=self.device, dtype=target_ct.dtype)
-                alpha = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-                predicted_ct = (noisy_ct - (1.0 - alpha).sqrt() * predicted_noise) / alpha.sqrt()
-                panel_chunks.append(torch.stack((cbct, target_ct, predicted_ct.clamp(-1, 1)), dim=1).detach().cpu())
+                    alphas_cumprod = scheduler.alphas_cumprod.to(device=self.device, dtype=target_ct.dtype)
+                    alpha = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                    predicted_ct = (noisy_ct - (1.0 - alpha).sqrt() * predicted_noise) / alpha.sqrt()
+                    row_items.append(predicted_ct.clamp(-1, 1))
+                    del timesteps, noise, noisy_ct, model_input, predicted_noise, predicted_ct
 
-                del cbct, target_ct, timesteps, noise, noisy_ct, model_input, predicted_noise, predicted_ct
+                panel_chunks.append(torch.stack(row_items, dim=1).detach().cpu())
+                del cbct, target_ct, row_items
             if was_training:
                 model.train()
 
@@ -175,13 +195,16 @@ class VisdomReporter:
             panel = self._to_visdom_range(panel, config)
             self.viz.images(
                 panel,
-                nrow=3,
+                nrow=2 + len(preview_timesteps),
                 win="samples",
-                opts={"title": f"Epoch {epoch}: CBCT / real CT / denoised prediction"},
+                opts={
+                    "title": f"Epoch {epoch}: CBCT / real CT / "
+                    + " / ".join(f"pred@t{timestep}" for timestep in preview_timesteps)
+                },
             )
             print(
                 f"Visdom samples updated: epoch={epoch}, groups={cbct_cpu.shape[0]}, "
-                f"inference_batch_size={inference_batch_size}"
+                f"inference_batch_size={inference_batch_size}, preview_timesteps={preview_timesteps}"
             )
         except Exception as exc:
             if was_training:
@@ -410,6 +433,7 @@ def main() -> None:
             "visdom_preview_on_start",
             "visdom_use_incoming_socket",
             "visdom_preview_timestep",
+            "visdom_preview_timesteps",
             "visdom_rotate_k",
             "visdom_flip_lr",
             "visdom_flip_ud",
