@@ -20,6 +20,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "output_dir": "DDPM/runs/baseline",
     "preprocessed_dir": "DDPM/preprocessed/pelvis",
     "use_preprocessed": False,
+    "auto_resume": False,
+    "resume_checkpoint": None,
     "seed": 42,
     "device": None,
     "spatial_size": [256, 256],
@@ -29,11 +31,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "batch_size": 4,
     "num_workers": 4,
     "epochs": 100,
+    "train_steps_per_epoch": 500,
+    "val_steps_per_epoch": 100,
     "lr": 1e-4,
     "val_interval": 1,
     "save_interval": 10,
     "num_train_timesteps": 1000,
     "num_inference_steps": 100,
+    "mhd_num_inference_steps": 25,
     "model_channels": [64, 128, 256],
     "attention_levels": [False, False, True],
     "num_res_blocks": 1,
@@ -49,8 +54,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "visdom_port": 8097,
     "visdom_env": "ddpm_pelvis",
     "visdom_interval": 1,
-    "visdom_num_images": 4,
+    "visdom_num_images": 6,
+    "visdom_inference_batch_size": 1,
+    "visdom_num_workers": 0,
+    "visdom_preview_on_start": True,
+    "visdom_use_incoming_socket": False,
     "visdom_num_inference_steps": 20,
+    "visdom_preview_timestep": 500,
+    "visdom_rotate_k": 1,
+    "visdom_flip_lr": False,
+    "visdom_flip_ud": False,
     "show_batch_progress": True,
     "amp": True,
     "cache_data": False,
@@ -63,6 +76,14 @@ def _resolve_relative_artifact_paths(config: Dict[str, Any], config_path: Path) 
         path = Path(config[key])
         if not path.is_absolute():
             config[key] = str((base_dir / path).resolve())
+
+    resume_checkpoint = config.get("resume_checkpoint")
+    if resume_checkpoint:
+        resume_text = str(resume_checkpoint).strip()
+        if resume_text.lower() not in ("latest", "best"):
+            path = Path(resume_text)
+            if not path.is_absolute():
+                config["resume_checkpoint"] = str((base_dir / path).resolve())
 
 
 def read_config(path: str | Path) -> Dict[str, Any]:
@@ -462,6 +483,7 @@ def save_checkpoint(
     epoch: int,
     best_val_loss: float,
     config: Mapping[str, Any],
+    scaler: Optional[Any] = None,
 ) -> None:
     checkpoint = {
         "model": model.state_dict(),
@@ -471,6 +493,8 @@ def save_checkpoint(
     }
     if optimizer is not None:
         checkpoint["optimizer"] = optimizer.state_dict()
+    if scaler is not None:
+        checkpoint["scaler"] = scaler.state_dict()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
@@ -480,6 +504,7 @@ def load_checkpoint(
     path: str | Path,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    scaler: Optional[Any] = None,
     map_location: str | torch.device = "cpu",
 ) -> Dict[str, Any]:
     checkpoint = torch.load(Path(path), map_location=map_location)
@@ -487,6 +512,8 @@ def load_checkpoint(
     model.load_state_dict(state_dict)
     if optimizer is not None and isinstance(checkpoint, dict) and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
+    if scaler is not None and isinstance(checkpoint, dict) and "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
     return checkpoint if isinstance(checkpoint, dict) else {"model": state_dict}
 
 

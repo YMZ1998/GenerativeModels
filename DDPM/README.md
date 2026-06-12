@@ -75,6 +75,8 @@ Edit `DDPM/config.json`, especially:
 - `hu_min` and `hu_max`
 - `batch_size`
 - `epochs`
+- `train_steps_per_epoch`
+- `val_steps_per_epoch`
 
 Then run:
 
@@ -102,6 +104,30 @@ Checkpoints are written to `output_dir`:
 - `best.pt`
 - `epoch_XXXX.pt` every `save_interval` epochs
 
+The default config has `auto_resume` enabled, so rerunning training will continue from `output_dir/latest.pt` when it exists:
+
+```powershell
+python DDPM/train.py --config DDPM/config.json
+```
+
+You can also choose a checkpoint explicitly:
+
+```powershell
+python DDPM/train.py --config DDPM/config.json --resume latest
+python DDPM/train.py --config DDPM/config.json --resume best
+python DDPM/train.py --config DDPM/config.json --resume DDPM/runs/pelvis_baseline/epoch_0010.pt
+```
+
+To force a fresh run without loading `latest.pt`:
+
+```powershell
+python DDPM/train.py --config DDPM/config.json --no-resume
+```
+
+Each epoch is iteration-based by default rather than a full pass over all cached slices. With the checked-in config, one training epoch is `train_steps_per_epoch=500` batches, and each validation run uses at most `val_steps_per_epoch=100` batches. Set either value to `0` or `null` to use the full DataLoader length.
+
+When resuming, `epochs` is treated as the target final epoch. For example, if `latest.pt` was saved at epoch 20 and `epochs` is 100, training continues from epoch 21 to epoch 100. With the default config this means continuing from iteration-block 21 to iteration-block 100, where each block has 500 training steps.
+
 The model learns to predict CT diffusion noise from `concat(CBCT, noisy_CT)`.
 
 ## Visdom
@@ -114,7 +140,7 @@ python -m pip install visdom
 python -m visdom.server -p 8097
 ```
 
-Then open `http://localhost:8097` in a browser and run training normally. With the default config, the environment is `ddpm_pelvis`; the sample panel shows three rows: CBCT, real CT, generated CT.
+Then open `http://localhost:8097` in a browser and run training normally. With the default config, the environment is `ddpm_pelvis`; the sample panel shows validation groups, one group per row: CBCT, real CT, and a denoised CT prediction from a fixed validation timestep. `visdom_num_images` controls how many groups are shown, while `visdom_inference_batch_size` controls how many preview samples are passed through the network at once. Keep `visdom_inference_batch_size=1` for 512x512 training to avoid CUDA out-of-memory during visualization. This is more useful during early training than full random-noise sampling, which will look like static until the model is well trained.
 
 ## Inference
 
@@ -132,6 +158,40 @@ The script preprocesses the CBCT with the configured orientation and spacing, sa
 
 The current baseline center-crops or pads each inference slice to `spatial_size`, so the output in-plane size follows the config rather than the original CBCT matrix size.
 
+For a 3D `.mhd` CBCT volume, use:
+
+```powershell
+python DDPM/infer_mhd.py
+```
+
+By default this reads:
+
+```text
+D:/Data/cbct/denoise_output.mhd
+```
+
+and writes:
+
+```text
+D:/Data/cbct/denoise_output_ddpm_sct.mhd
+```
+
+You can override paths and checkpoint selection:
+
+```powershell
+python DDPM/infer_mhd.py `
+  --input D:/Data/cbct/denoise_output.mhd `
+  --output D:/Data/cbct/denoise_output_ddpm_sct.mhd `
+  --checkpoint latest `
+  --scheduler ddim `
+  --num-inference-steps 25 `
+  --mode img2img `
+  --strength 0.35 `
+  --batch-size 1
+```
+
+The MHD script writes an `.mhd/.raw` pair and restores the prediction to the original input grid by default. Add `--keep-working-grid` only if you want to save the config-spacing working grid. MHD inference defaults to DDIM with `mhd_num_inference_steps=25` and `--mode img2img`, which starts from a noised CBCT slice so the output keeps input anatomy. Use `--mode sample` for pure DDPM sampling from noise, but that usually needs a well-trained in-domain model. Keep `--batch-size 1` for 512x512 inference if GPU memory is tight.
+
 ## Quick Smoke Test
 
 For a fast local check, create a tiny paired NIfTI dataset, then reduce the config:
@@ -141,6 +201,8 @@ For a fast local check, create a tiny paired NIfTI dataset, then reduce the conf
   "spatial_size": [64, 64],
   "batch_size": 1,
   "epochs": 1,
+  "train_steps_per_epoch": 2,
+  "val_steps_per_epoch": 1,
   "num_train_timesteps": 10,
   "num_inference_steps": 5,
   "model_channels": [8, 8, 8],
