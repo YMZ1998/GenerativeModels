@@ -1,0 +1,5 @@
+runs/
+preprocessed/
+visualizations/
+__pycache__/
+*.pyc
