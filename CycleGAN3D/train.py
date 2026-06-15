@@ -132,8 +132,15 @@ def move_batch(batch: Mapping[str, Any], device: torch.device) -> tuple[torch.Te
     return batch["A"].to(device=device, non_blocking=True), batch["B"].to(device=device, non_blocking=True)
 
 
-def mse_gan_loss(prediction: torch.Tensor, target_is_real: bool, criterion: nn.Module) -> torch.Tensor:
-    target = torch.ones_like(prediction) if target_is_real else torch.zeros_like(prediction)
+def mse_gan_loss(
+    prediction: torch.Tensor,
+    target_is_real: bool,
+    criterion: nn.Module,
+    real_label: float,
+    fake_label: float,
+) -> torch.Tensor:
+    target_value = float(real_label) if target_is_real else float(fake_label)
+    target = torch.full_like(prediction, target_value)
     return criterion(prediction, target)
 
 
@@ -142,10 +149,28 @@ def discriminator_loss(
     real: torch.Tensor,
     fake: torch.Tensor,
     criterion: nn.Module,
+    real_label: float,
+    fake_label: float,
 ) -> torch.Tensor:
     pred_real = get_discriminator_logits(discriminator(real))
     pred_fake = get_discriminator_logits(discriminator(fake.detach()))
-    return 0.5 * (mse_gan_loss(pred_real, True, criterion) + mse_gan_loss(pred_fake, False, criterion))
+    return 0.5 * (
+        mse_gan_loss(pred_real, True, criterion, real_label, fake_label)
+        + mse_gan_loss(pred_fake, False, criterion, real_label, fake_label)
+    )
+
+
+def gradient_loss_3d(prediction: torch.Tensor, target: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
+    losses = []
+    for dim in (2, 3, 4):
+        if prediction.shape[dim] <= 1:
+            continue
+        pred_grad = torch.diff(prediction, dim=dim)
+        target_grad = torch.diff(target, dim=dim)
+        losses.append(criterion(pred_grad, target_grad))
+    if not losses:
+        return prediction.new_tensor(0.0)
+    return sum(losses) / len(losses)
 
 
 def make_dataloader(
@@ -198,11 +223,24 @@ def train_one_epoch(
     use_amp = bool(config.get("amp", True))
     lambda_cycle = float(config["lambda_cycle"])
     lambda_identity = float(config["lambda_identity"])
+    lambda_paired_l1 = float(config.get("lambda_paired_l1", 0.0))
+    lambda_paired_gradient = float(config.get("lambda_paired_gradient", 0.0))
+    generator_update_steps = max(1, int(config.get("generator_update_steps", 1)))
+    real_label = float(config.get("real_label", 1.0))
+    fake_label = float(config.get("fake_label", 0.0))
     train_steps = int(config["train_steps_per_epoch"])
     log_interval = max(1, int(config.get("log_interval", 10)))
     show_progress = bool(config.get("show_batch_progress", True))
 
-    totals = {"G": 0.0, "D": 0.0, "cycle": 0.0, "identity": 0.0, "gan": 0.0}
+    totals = {
+        "G": 0.0,
+        "D": 0.0,
+        "cycle": 0.0,
+        "identity": 0.0,
+        "gan": 0.0,
+        "paired_l1": 0.0,
+        "paired_gradient": 0.0,
+    }
     progress = tqdm(
         loader,
         total=train_steps,
@@ -217,33 +255,39 @@ def train_one_epoch(
             break
         real_A, real_B = move_batch(batch, device)
 
-        set_requires_grad([D_A, D_B], False)
-        optimizer_G.zero_grad(set_to_none=True)
-        with autocast_context(device, use_amp):
-            fake_B = G_A2B(real_A)
-            rec_A = G_B2A(fake_B)
-            fake_A = G_B2A(real_B)
-            rec_B = G_A2B(fake_A)
-            idt_A = G_B2A(real_A)
-            idt_B = G_A2B(real_B)
+        for _ in range(generator_update_steps):
+            set_requires_grad([D_A, D_B], False)
+            optimizer_G.zero_grad(set_to_none=True)
+            with autocast_context(device, use_amp):
+                fake_B = G_A2B(real_A)
+                rec_A = G_B2A(fake_B)
+                fake_A = G_B2A(real_B)
+                rec_B = G_A2B(fake_A)
+                idt_A = G_B2A(real_A)
+                idt_B = G_A2B(real_B)
 
-            pred_fake_B = get_discriminator_logits(D_B(fake_B))
-            pred_fake_A = get_discriminator_logits(D_A(fake_A))
-            loss_gan = mse_gan_loss(pred_fake_B, True, gan_criterion) + mse_gan_loss(pred_fake_A, True, gan_criterion)
-            loss_cycle = (l1_criterion(rec_A, real_A) + l1_criterion(rec_B, real_B)) * lambda_cycle
-            loss_identity = (l1_criterion(idt_A, real_A) + l1_criterion(idt_B, real_B)) * lambda_identity
-            loss_G = loss_gan + loss_cycle + loss_identity
+                pred_fake_B = get_discriminator_logits(D_B(fake_B))
+                pred_fake_A = get_discriminator_logits(D_A(fake_A))
+                loss_gan = mse_gan_loss(pred_fake_B, True, gan_criterion, real_label, fake_label) + mse_gan_loss(
+                    pred_fake_A, True, gan_criterion, real_label, fake_label
+                )
+                loss_cycle = (l1_criterion(rec_A, real_A) + l1_criterion(rec_B, real_B)) * lambda_cycle
+                loss_identity = (l1_criterion(idt_A, real_A) + l1_criterion(idt_B, real_B)) * lambda_identity
+                loss_paired_l1 = l1_criterion(fake_B, real_B) * lambda_paired_l1
+                loss_paired_gradient = gradient_loss_3d(fake_B, real_B, l1_criterion) * lambda_paired_gradient
+                loss_G = loss_gan + loss_cycle + loss_identity + loss_paired_l1 + loss_paired_gradient
 
-        scaler.scale(loss_G).backward()
-        scaler.step(optimizer_G)
+            scaler.scale(loss_G).backward()
+            scaler.step(optimizer_G)
+            scaler.update()
 
         set_requires_grad([D_A, D_B], True)
         optimizer_D.zero_grad(set_to_none=True)
         fake_A_for_D = fake_pool_a.query(fake_A.detach()).to(device=device, non_blocking=True)
         fake_B_for_D = fake_pool_b.query(fake_B.detach()).to(device=device, non_blocking=True)
         with autocast_context(device, use_amp):
-            loss_D_A = discriminator_loss(D_A, real_A, fake_A_for_D, gan_criterion)
-            loss_D_B = discriminator_loss(D_B, real_B, fake_B_for_D, gan_criterion)
+            loss_D_A = discriminator_loss(D_A, real_A, fake_A_for_D, gan_criterion, real_label, fake_label)
+            loss_D_B = discriminator_loss(D_B, real_B, fake_B_for_D, gan_criterion, real_label, fake_label)
             loss_D = loss_D_A + loss_D_B
 
         scaler.scale(loss_D).backward()
@@ -256,6 +300,8 @@ def train_one_epoch(
             "cycle": float(loss_cycle.detach().cpu()),
             "identity": float(loss_identity.detach().cpu()),
             "gan": float(loss_gan.detach().cpu()),
+            "paired_l1": float(loss_paired_l1.detach().cpu()),
+            "paired_gradient": float(loss_paired_gradient.detach().cpu()),
         }
         for key, value in values.items():
             totals[key] += value
@@ -284,7 +330,7 @@ def validate(
     val_steps = int(config["val_steps_per_epoch"])
     show_progress = bool(config.get("show_batch_progress", True))
     sample_limit = max(1, int(config.get("visdom_num_images", 6)))
-    totals = {"val_l1_cbct2ct": 0.0, "val_cycle": 0.0, "val_identity": 0.0}
+    totals = {"val_l1_cbct2ct": 0.0, "val_gradient": 0.0, "val_cycle": 0.0, "val_identity": 0.0}
     sample_real_a: list[torch.Tensor] = []
     sample_fake_b: list[torch.Tensor] = []
     sample_real_b: list[torch.Tensor] = []
@@ -311,9 +357,11 @@ def validate(
             idt_A = G_B2A(real_A)
             idt_B = G_A2B(real_B)
             val_l1 = l1_criterion(fake_B, real_B)
+            val_gradient = gradient_loss_3d(fake_B, real_B, l1_criterion)
             val_cycle = l1_criterion(rec_A, real_A) + l1_criterion(rec_B, real_B)
             val_identity = l1_criterion(idt_A, real_A) + l1_criterion(idt_B, real_B)
         totals["val_l1_cbct2ct"] += float(val_l1.detach().cpu())
+        totals["val_gradient"] += float(val_gradient.detach().cpu())
         totals["val_cycle"] += float(val_cycle.detach().cpu())
         totals["val_identity"] += float(val_identity.detach().cpu())
         collected = sum(int(tensor.shape[0]) for tensor in sample_real_a)
@@ -406,10 +454,19 @@ def main() -> None:
             "val_steps_per_epoch",
             "lr_g",
             "lr_d",
+            "real_label",
+            "fake_label",
+            "generator_update_steps",
+            "train_paired_sampling",
             "lambda_cycle",
             "lambda_identity",
+            "lambda_paired_l1",
+            "lambda_paired_gradient",
+            "generator_type",
             "generator_channels",
             "generator_res_blocks",
+            "discriminator_type",
+            "discriminator_spectral_norm",
             "discriminator_channels",
             "discriminator_layers",
             "amp",
@@ -427,7 +484,9 @@ def main() -> None:
         train_records,
         config,
         int(config["train_steps_per_epoch"]),
-        paired=False,
+        paired=bool(config.get("train_paired_sampling", True))
+        or float(config.get("lambda_paired_l1", 0.0)) > 0.0
+        or float(config.get("lambda_paired_gradient", 0.0)) > 0.0,
         shuffle=True,
         device=device,
     )
@@ -519,7 +578,10 @@ def main() -> None:
                 {
                     "train_G": train_metrics["G"],
                     "train_D": train_metrics["D"],
+                    "paired_l1": train_metrics["paired_l1"],
+                    "paired_gradient": train_metrics["paired_gradient"],
                     "val_l1": val_metrics["val_l1_cbct2ct"],
+                    "val_gradient": val_metrics["val_gradient"],
                 },
             )
             if sample is not None:

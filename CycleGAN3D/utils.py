@@ -38,11 +38,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "lr_d": 2e-4,
     "beta1": 0.5,
     "beta2": 0.999,
+    "real_label": 0.9,
+    "fake_label": 0.1,
+    "generator_update_steps": 1,
+    "train_paired_sampling": True,
     "lambda_cycle": 10.0,
     "lambda_identity": 5.0,
+    "lambda_paired_l1": 5.0,
+    "lambda_paired_gradient": 2.0,
     "pool_size": 25,
+    "generator_type": "resnet",
     "generator_channels": 16,
     "generator_res_blocks": 4,
+    "discriminator_type": "patchgan",
+    "discriminator_spectral_norm": False,
     "discriminator_channels": 16,
     "discriminator_layers": 3,
     "val_fraction": 0.1,
@@ -61,8 +70,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "visdom_rotate_k": 1,
     "visdom_flip_lr": False,
     "visdom_flip_ud": False,
+    "infer_roi_size_hwd": None,
+    "infer_strategy": "z_sliding",
     "infer_sw_batch_size": 1,
-    "infer_overlap": 0.25,
+    "infer_overlap": 0.75,
+    "infer_blend_mode": "gaussian",
+    "infer_sigma_scale": 0.125,
+    "infer_padding_mode": "replicate",
+    "infer_tta": False,
     "infer_resize_xy": True,
     "output_dtype": "same",
 }
@@ -113,8 +128,22 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("xy_size and patch_size_hwd values must be positive.")
     if any(int(v) % 4 != 0 for v in patch_size):
         raise ValueError("patch_size_hwd values must be divisible by 4 for the 3D generator.")
+    infer_roi_size = config.get("infer_roi_size_hwd")
+    if infer_roi_size is not None:
+        if len(infer_roi_size) != 3:
+            raise ValueError("infer_roi_size_hwd must contain [height, width, depth] or be null.")
+        if any(int(v) <= 0 for v in infer_roi_size):
+            raise ValueError("infer_roi_size_hwd values must be positive.")
+        if any(int(v) % 4 != 0 for v in infer_roi_size):
+            raise ValueError("infer_roi_size_hwd values must be divisible by 4 for the 3D generator.")
     if float(config["hu_min"]) >= float(config["hu_max"]):
         raise ValueError("hu_min must be less than hu_max.")
+    if str(config.get("generator_type", "resnet")).lower() not in {"resnet", "resunet"}:
+        raise ValueError("generator_type must be 'resnet' or 'resunet'.")
+    if str(config.get("discriminator_type", "patchgan")).lower() not in {"patchgan", "spectral"}:
+        raise ValueError("discriminator_type must be 'patchgan' or 'spectral'.")
+    if str(config.get("infer_strategy", "z_sliding")).lower() not in {"z_sliding", "sliding_window", "whole"}:
+        raise ValueError("infer_strategy must be 'z_sliding', 'sliding_window', or 'whole'.")
     if int(config["train_steps_per_epoch"]) <= 0:
         raise ValueError("train_steps_per_epoch must be positive.")
     if int(config["val_steps_per_epoch"]) <= 0:

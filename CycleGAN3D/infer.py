@@ -7,7 +7,9 @@ from typing import Any, Dict, Mapping
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from monai.inferers import sliding_window_inference
+from tqdm import tqdm
 
 from models import make_generator
 from utils import (
@@ -26,6 +28,7 @@ from utils import (
 
 
 ARCHITECTURE_KEYS = (
+    "generator_type",
     "generator_channels",
     "generator_res_blocks",
 )
@@ -106,6 +109,128 @@ def restore_output(
     return cast_array(volume, reference_dtype, str(config.get("output_dtype", "same")))
 
 
+def get_infer_roi_size(config: Mapping[str, Any]) -> tuple[int, int, int]:
+    roi_size = config.get("infer_roi_size_hwd") or config["patch_size_hwd"]
+    return hwd_to_dhw(roi_size)
+
+
+def z_window_starts(depth: int, window: int, overlap: float) -> list[int]:
+    if depth <= window:
+        return [0]
+    stride = max(1, int(round(window * (1.0 - overlap))))
+    starts = list(range(0, depth - window + 1, stride))
+    last_start = depth - window
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    return starts
+
+
+def z_blend_weight(window: int, config: Mapping[str, Any], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    mode = str(config.get("infer_blend_mode", "gaussian")).lower()
+    if mode == "constant" or window <= 1:
+        weight = torch.ones(window, device=device, dtype=dtype)
+    else:
+        coords = torch.arange(window, device=device, dtype=dtype) - (window - 1) * 0.5
+        sigma = max(float(window) * float(config.get("infer_sigma_scale", 0.125)), 1.0)
+        weight = torch.exp(-0.5 * (coords / sigma) ** 2)
+        weight = torch.clamp(weight, min=1.0e-3)
+    return weight.view(1, 1, window, 1, 1)
+
+
+def z_sliding_predict(
+    model: torch.nn.Module,
+    tensor: torch.Tensor,
+    roi_size: tuple[int, int, int],
+    config: Mapping[str, Any],
+) -> torch.Tensor:
+    _, _, depth, _, _ = tensor.shape
+    roi_d = max(4, int(roi_size[0]))
+    if roi_d % 4 != 0:
+        roi_d = int(np.ceil(roi_d / 4.0) * 4)
+
+    starts = z_window_starts(depth, roi_d, float(config.get("infer_overlap", 0.75)))
+    output_sum = torch.zeros_like(tensor)
+    weight_sum = torch.zeros_like(tensor)
+    full_weight = z_blend_weight(roi_d, config, tensor.device, tensor.dtype)
+    padding_mode = str(config.get("infer_padding_mode", "replicate"))
+
+    for start in tqdm(starts, desc="Z-only inference", unit="chunk", dynamic_ncols=True):
+        end = min(start + roi_d, depth)
+        chunk = tensor[:, :, start:end]
+        valid_d = int(chunk.shape[2])
+        if valid_d < roi_d:
+            chunk = F.pad(chunk, (0, 0, 0, 0, 0, roi_d - valid_d), mode=padding_mode)
+        pred = model(chunk)[:, :, :valid_d]
+        weight = full_weight[:, :, :valid_d]
+        output_sum[:, :, start:end] += pred * weight
+        weight_sum[:, :, start:end] += weight
+
+    return output_sum / torch.clamp(weight_sum, min=1.0e-6)
+
+
+def sliding_window_predict(
+    model: torch.nn.Module,
+    tensor: torch.Tensor,
+    roi_size: tuple[int, int, int],
+    config: Mapping[str, Any],
+) -> torch.Tensor:
+    kwargs = {
+        "inputs": tensor,
+        "roi_size": roi_size,
+        "sw_batch_size": int(config.get("infer_sw_batch_size", 1)),
+        "predictor": model,
+        "overlap": float(config.get("infer_overlap", 0.75)),
+        "mode": str(config.get("infer_blend_mode", "gaussian")),
+        "sigma_scale": float(config.get("infer_sigma_scale", 0.125)),
+        "padding_mode": str(config.get("infer_padding_mode", "replicate")),
+        "progress": True,
+    }
+    removable_keys = ("progress", "padding_mode", "sigma_scale")
+    while True:
+        try:
+            return sliding_window_inference(**kwargs)
+        except TypeError:
+            for key in removable_keys:
+                if key in kwargs:
+                    kwargs.pop(key)
+                    break
+            else:
+                raise
+
+
+def predict_once(
+    model: torch.nn.Module,
+    tensor: torch.Tensor,
+    roi_size: tuple[int, int, int],
+    config: Mapping[str, Any],
+) -> torch.Tensor:
+    strategy = str(config.get("infer_strategy", "z_sliding")).lower()
+    if strategy in {"z", "z_only", "z_sliding"}:
+        return z_sliding_predict(model, tensor, roi_size, config)
+    if strategy in {"sliding", "sliding_window", "monai"}:
+        return sliding_window_predict(model, tensor, roi_size, config)
+    if strategy in {"whole", "whole_volume"}:
+        return model(tensor)
+    raise ValueError("infer_strategy must be 'z_sliding', 'sliding_window', or 'whole'.")
+
+
+def maybe_tta_predict(
+    model: torch.nn.Module,
+    tensor: torch.Tensor,
+    roi_size: tuple[int, int, int],
+    config: Mapping[str, Any],
+) -> torch.Tensor:
+    if not bool(config.get("infer_tta", False)):
+        return predict_once(model, tensor, roi_size, config)
+
+    outputs = [predict_once(model, tensor, roi_size, config)]
+    for dims in ((-1,), (-2,), (-2, -1)):
+        flipped = torch.flip(tensor, dims=dims)
+        pred = predict_once(model, flipped, roi_size, config)
+        outputs.append(torch.flip(pred, dims=dims))
+    return torch.stack(outputs, dim=0).mean(dim=0)
+
+
 @torch.no_grad()
 def run_inference(
     model: torch.nn.Module,
@@ -114,39 +239,51 @@ def run_inference(
     device: torch.device,
 ) -> np.ndarray:
     tensor = torch.from_numpy(np.ascontiguousarray(volume[None, None]).astype(np.float32)).to(device)
-    roi_size = hwd_to_dhw(config["patch_size_hwd"])
-    kwargs = {
-        "inputs": tensor,
-        "roi_size": roi_size,
-        "sw_batch_size": int(config.get("infer_sw_batch_size", 1)),
-        "predictor": model,
-        "overlap": float(config.get("infer_overlap", 0.25)),
-        "mode": "gaussian",
-        "progress": True,
-    }
+    roi_size = get_infer_roi_size(config)
     warnings.filterwarnings(
         "ignore",
         message="Using a non-tuple sequence for multidimensional indexing.*",
         category=UserWarning,
         module="monai.inferers.utils",
     )
-    try:
-        output = sliding_window_inference(**kwargs)
-    except TypeError:
-        kwargs.pop("progress")
-        output = sliding_window_inference(**kwargs)
+    output = maybe_tta_predict(model, tensor, roi_size, config)
     return output[0, 0].detach().cpu().numpy()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run 3D CycleGAN CBCT-to-CT inference.")
-    parser.add_argument("--config", default="CycleGAN3D/config.json", help="Path to config.json.")
+    parser.add_argument("--config", default="./config.json", help="Path to config.json.")
     parser.add_argument("--input", default="D:/Data/cbct/denoise_output.mhd", help="Input .nii/.nii.gz/.mhd/.mha file.")
+    # parser.add_argument('--input', type=str, default=r"E:\Data\synthRAD2025_Task2_Train\Task2\TH\2THA005\cbct.mha", help="Path to cbct file")
     parser.add_argument("--output", default=None, help="Output path. Defaults to *_cyclegan3d_sct.")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint path. Defaults to output_dir/best.pt.")
+    parser.add_argument(
+        "--roi-size",
+        type=int,
+        nargs=3,
+        metavar=("H", "W", "D"),
+        default=None,
+        help="Override infer_roi_size_hwd.",
+    )
+    parser.add_argument("--overlap", type=float, default=None, help="Override infer_overlap.")
+    parser.add_argument(
+        "--strategy",
+        choices=["z_sliding", "sliding_window", "whole"],
+        default=None,
+        help="Override infer_strategy.",
+    )
+    parser.add_argument("--tta", action="store_true", help="Enable flip test-time augmentation.")
     args = parser.parse_args()
 
     config = read_config(args.config)
+    if args.roi_size is not None:
+        config["infer_roi_size_hwd"] = list(args.roi_size)
+    if args.overlap is not None:
+        config["infer_overlap"] = float(args.overlap)
+    if args.strategy is not None:
+        config["infer_strategy"] = args.strategy
+    if args.tta:
+        config["infer_tta"] = True
     set_seed(int(config["seed"]))
     device = get_device(config)
 
@@ -163,11 +300,17 @@ def main() -> None:
             "device",
             "xy_size",
             "patch_size_hwd",
+            "infer_roi_size_hwd",
+            "infer_strategy",
             "hu_min",
             "hu_max",
             "infer_resize_xy",
             "infer_sw_batch_size",
             "infer_overlap",
+            "infer_blend_mode",
+            "infer_sigma_scale",
+            "infer_padding_mode",
+            "infer_tta",
             "output_dtype",
         ],
         title="3D CycleGAN Inference",
